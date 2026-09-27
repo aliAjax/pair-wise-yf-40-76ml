@@ -24,7 +24,16 @@ python3 app.py --db ./data.db --port 8306
 
 ## 核心对象
 
-- `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点。
+- `consignment`：检疫批次；登记时可填`source_batch_id`（来源批次）和`receiving_facility_id`（接收设施），两者都会校验引用存在。
+- `facility`：温室、苗圃或下游种植点。
+- `review`：传播复核记录；确认虫害后自动为下游批次和相关设施创建。
+
+## 传播追溯流程
+
+1. 批次执行`quarantine`（确认虫害）后，系统按`source_batch_id`逐级（BFS）找出所有下游批次。
+2. 下游批次及其链上所有接收设施自动创建`review`（状态`pending`），目标对象进入`under_review`并记录原状态；已有待复核记录的对象不会重复创建。
+3. 复核动作：`confirm`后批次进入`quarantined`、设施进入`locked`，并继续追溯该批次下游；`exclude`后目标恢复复核前状态。
+4. `GET /api/trace/<consignment_id>`返回整条传播关系（含层级深度）、各对象状态、复核记录和处理进度统计；`POST /api/trace/<consignment_id>`可对已隔离批次手动重新触发追溯。
 
 ## 主要接口
 
@@ -33,6 +42,8 @@ python3 app.py --db ./data.db --port 8306
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `GET /api/trace/<id>`：查询传播链与复核进度。
+- `POST /api/trace/<id>`：手动触发追溯（要求批次已隔离）。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。

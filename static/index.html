@@ -6,29 +6,266 @@
   <title>植物病虫害检疫与传播追溯</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
+    main { max-width: 880px; margin: auto; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    button { padding: .5rem .8rem; cursor: pointer; }
+    button { padding: .4rem .8rem; cursor: pointer; }
+    input, select, textarea { padding: .35rem; margin: .15rem 0; max-width: 100%; }
+    section { border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem; margin-bottom: 1.2rem; }
+    label { display: inline-block; min-width: 7rem; }
+    .badge { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .8rem; background: #e5e7eb; }
+    .st-declared, .st-registered { background: #dbeafe; }
+    .st-inspected, .st-traced { background: #e0e7ff; }
+    .st-quarantined, .st-locked, .st-confirmed { background: #fee2e2; }
+    .st-released, .st-excluded { background: #dcfce7; }
+    .st-under_review, .st-pending { background: #fef9c3; }
+    .st-destroyed { background: #d1d5db; }
+    .node { padding: .35rem .5rem; border-left: 3px solid #d1d5db; margin: .3rem 0; background: #f9fafb; border-radius: 0 6px 6px 0; }
+    .node .actions, .facility .actions { margin-left: .5rem; }
+    .facility { padding: .35rem .5rem; margin: .3rem 0; background: #f9fafb; border-radius: 6px; }
+    .bar { display: flex; height: .9rem; border-radius: 4px; overflow: hidden; background: #f3f4f6; margin: .4rem 0; }
+    .bar > div { height: 100%; }
+    .seg-pending { background: #facc15; }
+    .seg-confirmed { background: #ef4444; }
+    .seg-excluded { background: #22c55e; }
+    .muted { color: #6b7280; font-size: .85rem; }
   </style>
 </head>
 <body>
 <main>
   <h1>植物病虫害检疫与传播追溯</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
+  <p><button onclick="checkHealth()">检查服务状态</button> <button onclick="refreshAll()">刷新列表</button></p>
   <pre id="result">等待操作</pre>
+
+  <section>
+    <h2>批次登记</h2>
+    <p><label>批次号</label><input id="c-code" placeholder="C-100"></p>
+    <p><label>来源地</label><input id="c-origin" placeholder="Port-A"></p>
+    <p><label>目的地</label><input id="c-destination" placeholder="Farm-B"></p>
+    <p><label>来源批次</label><select id="c-source"><option value="">（无）</option></select></p>
+    <p><label>接收设施</label><select id="c-facility"><option value="">（无）</option></select></p>
+    <p><button onclick="createConsignment()">登记批次</button></p>
+  </section>
+
+  <section>
+    <h2>批次动作</h2>
+    <p class="muted">对批次执行 inspect / quarantine 等动作；确认虫害（quarantine，pest_found=true）后会自动逐级追溯下游批次并生成待复核记录。</p>
+    <p><label>批次 ID</label><select id="a-entity"></select></p>
+    <p><label>动作</label><input id="a-action" placeholder="inspect / quarantine / release"></p>
+    <p><label>数据(JSON)</label><textarea id="a-data" rows="3" cols="50">{"inspector":"I-1","inspection_result":"suspected"}</textarea></p>
+    <p><button onclick="submitAction()">提交动作</button></p>
+  </section>
+
+  <section>
+    <h2>传播链追溯</h2>
+    <p><label>起始批次</label><select id="chain-root"></select>
+    <button onclick="loadChain()">加载传播链</button></p>
+    <div id="chain"></div>
+  </section>
+
   <h2>常用接口</h2>
   <pre>GET  /health
-GET  /api/&lt;kind&gt;
+GET  /api/&lt;kind&gt;            （consignment / facility / review）
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+GET  /api/trace/&lt;id&gt;        （传播链与复核进度）
+POST /api/trace/&lt;id&gt;        （对已隔离批次重新触发追溯）
+GET  /api/audit</pre>
 </main>
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+const HEADERS = {"Content-Type": "application/json", "X-User-Id": "page-demo", "X-Role": "admin"};
+const STATUS_LABELS = {
+  declared: "已申报", inspected: "已检查", quarantined: "已隔离", released: "已放行",
+  destroyed: "已销毁", under_review: "待复核", registered: "已登记", traced: "已追溯",
+  locked: "已锁定", pending: "待复核", confirmed: "已确认", excluded: "已排除"
+};
+let consignments = [];
+let facilities = [];
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || ("HTTP " + response.status));
+  return payload;
 }
+
+function show(value) {
+  document.getElementById("result").textContent =
+    typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
+async function run(task) {
+  try { await task(); } catch (err) { show("错误：" + err.message); }
+}
+
+function short(id) { return id.slice(0, 8); }
+
+function labelOf(entity) {
+  const name = entity.data.code || entity.data.name || "";
+  return (name ? name + " · " : "") + short(entity.id) + " · " + (STATUS_LABELS[entity.status] || entity.status);
+}
+
+function badge(status) {
+  const span = document.createElement("span");
+  span.className = "badge st-" + status;
+  span.textContent = STATUS_LABELS[status] || status;
+  return span;
+}
+
+function fillSelect(select, items, keepValue) {
+  const current = keepValue ? select.value : null;
+  while (select.options.length > (select.options[0] && select.options[0].value === "" ? 1 : 0)) {
+    select.remove(select.options.length - 1);
+  }
+  for (const item of items) {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = labelOf(item);
+    select.appendChild(option);
+  }
+  if (current) select.value = current;
+}
+
+async function refreshAll() {
+  consignments = (await api("/api/consignment")).items;
+  facilities = (await api("/api/facility")).items;
+  fillSelect(document.getElementById("c-source"), consignments, true);
+  fillSelect(document.getElementById("c-facility"), facilities, true);
+  fillSelect(document.getElementById("a-entity"), consignments, true);
+  fillSelect(document.getElementById("chain-root"), consignments, true);
+}
+
+async function checkHealth() {
+  await run(async () => show(await api("/health")));
+}
+
+async function createConsignment() {
+  await run(async () => {
+    const data = {
+      code: document.getElementById("c-code").value,
+      origin: document.getElementById("c-origin").value,
+      destination: document.getElementById("c-destination").value
+    };
+    const source = document.getElementById("c-source").value;
+    const facility = document.getElementById("c-facility").value;
+    if (source) data.source_batch_id = source;
+    if (facility) data.receiving_facility_id = facility;
+    const created = await api("/api/consignment", {method: "POST", headers: HEADERS, body: JSON.stringify(data)});
+    show(created);
+    await refreshAll();
+  });
+}
+
+async function submitAction() {
+  await run(async () => {
+    const id = document.getElementById("a-entity").value;
+    const action = document.getElementById("a-action").value;
+    const data = JSON.parse(document.getElementById("a-data").value || "{}");
+    const updated = await api("/api/entities/" + id + "/actions", {
+      method: "POST", headers: HEADERS, body: JSON.stringify({action, data})
+    });
+    show(updated);
+    await refreshAll();
+  });
+}
+
+function reviewButtons(review, reload) {
+  const wrap = document.createElement("span");
+  wrap.className = "actions";
+  for (const [action, text] of [["confirm", "确认"], ["exclude", "排除"]]) {
+    const button = document.createElement("button");
+    button.textContent = text;
+    button.onclick = () => run(async () => {
+      await api("/api/entities/" + review.id + "/actions", {
+        method: "POST", headers: HEADERS, body: JSON.stringify({action, data: {}})
+      });
+      await reload();
+    });
+    wrap.appendChild(button);
+  }
+  return wrap;
+}
+
+async function loadChain() {
+  await run(async () => {
+    const root = document.getElementById("chain-root").value;
+    if (!root) { show("请先选择起始批次"); return; }
+    const chain = await api("/api/trace/" + root);
+    renderChain(chain);
+    show(chain);
+    await refreshAll();
+  });
+}
+
+function renderChain(chain) {
+  const box = document.getElementById("chain");
+  box.innerHTML = "";
+  const reload = async () => {
+    const fresh = await api("/api/trace/" + chain.root);
+    renderChain(fresh);
+    show(fresh);
+    await refreshAll();
+  };
+
+  const p = chain.progress;
+  const summary = document.createElement("p");
+  summary.textContent = "复核进度：共 " + p.total + " 条 — 待复核 " + p.pending +
+    " · 已确认 " + p.confirmed + " · 已排除 " + p.excluded;
+  box.appendChild(summary);
+  const bar = document.createElement("div");
+  bar.className = "bar";
+  for (const [key, cls] of [["confirmed", "seg-confirmed"], ["pending", "seg-pending"], ["excluded", "seg-excluded"]]) {
+    const seg = document.createElement("div");
+    seg.className = cls;
+    seg.style.width = p.total ? (p[key] / p.total * 100) + "%" : "0";
+    bar.appendChild(seg);
+  }
+  box.appendChild(bar);
+
+  const title = document.createElement("h3");
+  title.textContent = "传播关系";
+  box.appendChild(title);
+  for (const node of chain.nodes) {
+    const row = document.createElement("div");
+    row.className = "node";
+    row.style.marginLeft = (node.depth * 1.6) + "rem";
+    row.appendChild(document.createTextNode((node.code || short(node.id)) + " "));
+    row.appendChild(badge(node.status));
+    if (node.receiving_facility_id) {
+      const facility = chain.facilities.find(f => f.id === node.receiving_facility_id);
+      const hint = document.createElement("span");
+      hint.className = "muted";
+      hint.textContent = " → 接收设施：" + (facility ? facility.name : short(node.receiving_facility_id));
+      row.appendChild(hint);
+    }
+    if (node.review) {
+      row.appendChild(document.createTextNode(" 复核:"));
+      row.appendChild(badge(node.review.status));
+      if (node.review.status === "pending") row.appendChild(reviewButtons(node.review, reload));
+    }
+    box.appendChild(row);
+  }
+
+  if (chain.facilities.length) {
+    const ftitle = document.createElement("h3");
+    ftitle.textContent = "相关设施";
+    box.appendChild(ftitle);
+    for (const facility of chain.facilities) {
+      const row = document.createElement("div");
+      row.className = "facility";
+      row.appendChild(document.createTextNode(facility.name + " "));
+      row.appendChild(badge(facility.status));
+      if (facility.review) {
+        row.appendChild(document.createTextNode(" 复核:"));
+        row.appendChild(badge(facility.review.status));
+        if (facility.review.status === "pending") row.appendChild(reviewButtons(facility.review, reload));
+      }
+      box.appendChild(row);
+    }
+  }
+}
+
+run(refreshAll);
 </script>
 </body>
 </html>

@@ -8,9 +8,37 @@ from .domain import (
 )
 
 
+REVIEW_FLAGGABLE_STATUSES = {
+    "consignment": ("declared", "inspected", "released"),
+    "facility": ("registered", "traced"),
+}
+
+
 def _validate_consignment(actor, data, lookup):
     if data.get("origin") == data.get("destination"):
         raise ValidationError("origin and destination must differ")
+    source_id = data.get("source_batch_id")
+    if source_id:
+        if data.get("id") and source_id == data.get("id"):
+            raise ValidationError("source_batch_id cannot reference itself")
+        if not _find_one(lookup, "consignment", "id", source_id):
+            raise ValidationError("unknown source batch: " + str(source_id))
+    facility_id = data.get("receiving_facility_id")
+    if facility_id and not _find_one(lookup, "facility", "id", facility_id):
+        raise ValidationError("unknown receiving facility: " + str(facility_id))
+
+
+def _validate_review(actor, data, lookup):
+    target_kind = data.get("target_kind")
+    if target_kind not in REVIEW_FLAGGABLE_STATUSES:
+        raise ValidationError("target_kind must be consignment or facility")
+    target = _find_one(lookup, target_kind, "id", data.get("target_id"))
+    if not target:
+        raise ValidationError("unknown review target: " + str(data.get("target_id")))
+    if target["status"] not in REVIEW_FLAGGABLE_STATUSES[target_kind]:
+        raise ValidationError(
+            "target cannot be placed under review from status " + target["status"]
+        )
 
 
 def _validate_quarantine(actor, entity, data, lookup):
@@ -27,34 +55,38 @@ def _validate_release(actor, entity, data, lookup):
     return {"released_by": actor.user_id}
 
 
-def trace_downstream(consignments, start_id):
-    pending = [start_id]
+def trace_downstream_tree(consignments, start_id):
+    pending = [(start_id, 0)]
     visited = set()
     result = []
     while pending:
-        current = pending.pop(0)
+        current, depth = pending.pop(0)
         if current in visited:
             continue
         visited.add(current)
-        result.append(current)
+        result.append({"id": current, "depth": depth})
         for item in consignments:
             if item.get("parent_id") == current:
-                pending.append(item.get("id"))
+                pending.append((item.get("id"), depth + 1))
     return result
 
 
-CUSTOM_CREATE = {'consignment': _validate_consignment}
+def trace_downstream(consignments, start_id):
+    return [item["id"] for item in trace_downstream_tree(consignments, start_id)]
+
+
+CUSTOM_CREATE = {'consignment': _validate_consignment, 'review': _validate_review}
 CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('consignment', 'release'): _validate_release}
 
 
 class RuleEngine:
-    ALIASES = {'consignments': 'consignment', 'facilities': 'facility'}
-    INITIAL_STATUS = {'consignment': 'declared', 'facility': 'registered'}
-    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected')}, 'facility': {'trace': (('registered',), 'traced')}}
-    CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address')}
+    ALIASES = {'consignments': 'consignment', 'facilities': 'facility', 'reviews': 'review'}
+    INITIAL_STATUS = {'consignment': 'declared', 'facility': 'registered', 'review': 'pending'}
+    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected'), 'flag_review': (('declared', 'inspected', 'released'), 'under_review')}, 'facility': {'trace': (('registered',), 'traced'), 'flag_review': (('registered', 'traced'), 'under_review')}, 'review': {'confirm': (('pending',), 'confirmed'), 'exclude': (('pending',), 'excluded')}}
+    CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address'), 'review': ('target_kind', 'target_id')}
     ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('facility', 'trace'): ('consignment_ids',)}
-    CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine')}
-    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine')}
+    CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine'), 'review': ('admin', 'quarantine')}
+    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine'), 'flag_review': ('admin', 'quarantine'), 'confirm': ('admin', 'quarantine'), 'exclude': ('admin', 'quarantine')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
