@@ -11,12 +11,36 @@ from .domain import (
 def _validate_consignment(actor, data, lookup):
     if data.get("origin") == data.get("destination"):
         raise ValidationError("origin and destination must differ")
+    source_id = data.get("source_batch_id")
+    if source_id:
+        if data.get("id") == source_id:
+            raise ValidationError("source_batch_id cannot reference itself")
+        if not _find_one(lookup, "consignment", "id", source_id):
+            raise ValidationError("unknown source batch: " + str(source_id))
+    facility_id = data.get("facility_id")
+    if facility_id and not _find_one(lookup, "facility", "id", facility_id):
+        raise ValidationError("unknown receiving facility: " + str(facility_id))
 
 
 def _validate_quarantine(actor, entity, data, lookup):
     if not data.get("pest_found"):
         raise ValidationError("pest_found must be true for quarantine")
     return {"quarantined_by": actor.user_id}
+
+
+def _validate_confirm_review(actor, entity, data, lookup):
+    return {"review_result": "confirmed", "reviewed_by": actor.user_id}
+
+
+def _validate_clear_review(actor, entity, data, lookup):
+    previous = entity.get("data", {}).get("review_previous_status")
+    if previous not in ("declared", "inspected", "registered", "traced"):
+        raise ValidationError("no restorable previous status recorded")
+    return {
+        "next_status": previous,
+        "review_result": "cleared",
+        "reviewed_by": actor.user_id,
+    }
 
 
 def _validate_release(actor, entity, data, lookup):
@@ -44,17 +68,17 @@ def trace_downstream(consignments, start_id):
 
 
 CUSTOM_CREATE = {'consignment': _validate_consignment}
-CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('consignment', 'release'): _validate_release}
+CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('consignment', 'release'): _validate_release, ('consignment', 'confirm_review'): _validate_confirm_review, ('consignment', 'clear_review'): _validate_clear_review, ('facility', 'confirm_review'): _validate_confirm_review, ('facility', 'clear_review'): _validate_clear_review}
 
 
 class RuleEngine:
     ALIASES = {'consignments': 'consignment', 'facilities': 'facility'}
     INITIAL_STATUS = {'consignment': 'declared', 'facility': 'registered'}
-    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected')}, 'facility': {'trace': (('registered',), 'traced')}}
+    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected'), 'mark_review': (('declared', 'inspected'), 'pending_review'), 'confirm_review': (('pending_review',), 'quarantined'), 'clear_review': (('pending_review',), None)}, 'facility': {'trace': (('registered',), 'traced'), 'mark_review': (('registered', 'traced'), 'pending_review'), 'confirm_review': (('pending_review',), 'restricted'), 'clear_review': (('pending_review',), None)}}
     CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address')}
-    ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('facility', 'trace'): ('consignment_ids',)}
+    ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('consignment', 'confirm_review'): ('sample_id',), ('consignment', 'clear_review'): ('reason',), ('facility', 'clear_review'): ('reason',), ('facility', 'trace'): ('consignment_ids',)}
     CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine')}
-    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine')}
+    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine'), 'mark_review': ('admin', 'quarantine'), 'confirm_review': ('admin', 'quarantine'), 'clear_review': ('admin', 'quarantine')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -107,7 +131,10 @@ class RuleEngine:
         extra = custom(actor, entity, data, lookup) if custom else {}
         patch = dict(data)
         if extra:
+            next_status = extra.pop("next_status", None) or next_status
             patch.update(extra)
+        if not next_status:
+            raise InvalidTransition("no target status for action %s" % action)
         return next_status, patch
 
 

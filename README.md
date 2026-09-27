@@ -26,6 +26,13 @@ python3 app.py --db ./data.db --port 8306
 
 - `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点。
 
+## 传播追溯与复核
+
+- 登记批次时可填 `source_batch_id`（来源批次）和 `facility_id`（接收设施），两者都会校验必须已存在。
+- 批次确认虫害（`quarantine`）后，系统按来源关系逐级找出所有下游批次，连同涉及的设施一起自动置为 `pending_review`（待复核），并记录疫情源头与原状态。
+- 复核动作：`confirm_review` 确认后批次进入 `quarantined`、设施进入 `restricted`；`clear_review` 排除后恢复各自原状态。复核结果写入 `review_result`（`pending`/`confirmed`/`cleared`）。
+- `GET /api/trace/<source_id>` 返回整条传播链（含层级）、涉及设施和复核进度统计；演示页面 `/` 提供传播关系图与复核操作。
+
 ## 主要接口
 
 - `GET /health`：健康检查。
@@ -33,6 +40,7 @@ python3 app.py --db ./data.db --port 8306
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `GET /api/trace/<source_id>`：查询某批次的传播链与复核进度。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
